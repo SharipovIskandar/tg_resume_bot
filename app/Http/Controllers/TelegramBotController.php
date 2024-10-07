@@ -22,29 +22,46 @@ class TelegramBotController extends Controller
     public function handleWebhook(Request $request)
     {
         try {
+
             $data = $request->all();
             $chat_id = $data['message']['chat']['id'];
             $name = $data['message']['from']['first_name'] ?? 'Foydalanuvchi';
             $text = $data['message']['text'] ?? '';
 
+            if ($data['callback_query']) {
+                $callbackQuery = $data['callback_query'];
+                $callbackData = $callbackQuery['data'];
+                $chat_id = $callbackQuery['from']['id'];
+
+                $this->handleCallbackQuery($callbackQuery);
+            }
             $user = TgUser::firstOrCreate(
                 ['chat_id' => $chat_id],
                 ['name' => $name]
             );
+
+            $user = TgUser::where("chat_id", $chat_id)->first();
+
             if (str_contains($text, '/start')) {
                 $this->sendMessage($chat_id, "🎉 Botimizga xush kelibsiz, {$name}! Siz rezyumeingizni yaratmoqchimisiz? Barcha imkoniyatlaringizni o'rganing! \n🔍 Rezyume qo'shish uchun /add_resume <rezyume ma'lumotlari> yozing. \n📜 Har qanday yordam uchun /help.");
             } elseif (str_contains($text, '/add_resume')) {
-                Redis::set("resume_$chat_id", $text);
-                $this->sendMessage($chat_id, "📋 Rezyumeingizni qo'shish uchun quyidagi ma'lumotlarni kiriting:\n\n1️⃣ To'liq ismingiz va familiyangiz.\n2️⃣ Ish tajribangiz (Qaysi kompaniyalarda ishlagansiz?).\n3️⃣ Ta'lim darajangiz (Qayerda tahsil olgansiz?).\n4️⃣ Qo'shimcha ko'nikmalar (Qanday malakalarga va sertifikatlarga egasiz?).\n\n✍️ Batafsil ma'lumot kiritganingizga ishonch hosil qiling. Rezyumeingiz qanchalik to'liq bo'lsa, shunchalik ko'proq imkoniyatlarga ega bo'lasiz!");
+                $cleanedText = str_replace('/add_resume', '', $text);
+                $this->saveResume($chat_id, $cleanedText);
+            } elseif (str_contains($text, '/show_resumes')) {
+                if ($user) {
+
+                    $resumes = Resume::query()->where('user_id', $user->id)->get();
+                    $this->showResumesWithButtons($chat_id, $resumes);
+                }
             } elseif (str_contains($text, '/help')) {
                 $this->sendMessage($chat_id, "📖 **Yordam**\n\n- **/start**: Botni boshlash\n- **/add_resume**: Rezyume qo'shish\n- **/help**: Yordam olish");
-            } elseif ($text === 'Ha') {
-                $resume_data = Redis::get("resume_$chat_id");
-                $this->saveResume($chat_id, $resume_data);
-                Redis::del("resume_$chat_id");
-            } elseif ($text === "Yo'q") {
-                $this->sendMessage($chat_id, "❌ Kiritilgan ma'lumotlar rad etildi.");
-                session(['awaiting_input' => null]);
+            }
+            if (preg_match('/edit_resume_(\d+)/', $callbackData, $matches)) {
+                $resumeIndex = (int)$matches[1] - 1; // 1 dan boshlangani uchun -1
+                $this->editResume($chat_id, $resumeIndex);
+            } elseif (preg_match('/remove_resume_(\d+)/', $callbackData, $matches)) {
+                $resumeIndex = (int)$matches[1] - 1; // 1 dan boshlangani uchun -1
+                $this->removeResume($chat_id, $resumeIndex);
             } else {
                 $resume_data = Redis::get("resume_$chat_id");
                 if ($resume_data) {
@@ -53,7 +70,8 @@ class TelegramBotController extends Controller
                     $this->sendMessage($chat_id, "❓ Qanday yordam kerak? /help komandasini yuboring.");
                 }
             }
-        } catch (\Exception $e) {
+        } catch
+        (\Exception $e) {
             Log::error('Xatolik yuz berdi: ' . $e->getMessage());
 
             if (isset($chat_id)) {
@@ -95,9 +113,9 @@ class TelegramBotController extends Controller
                 'user_id' => $user->id,
                 'resume_data' => $resume,
             ]);
-            if($resume) {
+            if ($resume) {
                 $this->sendMessage($chat_id, "✅ Sizning rezyumeingiz saqlandi!");
-            }else{
+            } else {
                 $this->sendMessage($chat_id, 'Sizning rezyumeingiz saqlanmagan!');
             }
         } else {
@@ -116,11 +134,85 @@ class TelegramBotController extends Controller
         ]);
     }
 
+    public function showResumesWithButtons($chat_id, $resumes)
+    {
+        $message = "📄 Sizning rezyumelaringiz:\n";
+        $buttons = [];
+
+        foreach ($resumes as $index => $resume) {
+            $number = $index + 1; // 1 dan boshlash
+            $message .= "$number. {$resume->resume_data}\n";
+            // Har bir rezyume uchun tugma qo'shish
+            $buttons[] = [
+                [
+                    'text' => "Tahrir qilish $number",
+                    'callback_data' => "edit_resume_$number" // Tugma bosilganda muayyan rezyumeni tahrir qilish uchun
+                ],
+                [
+                    'text' => "O'chirish $number",
+                    'callback_data' => "remove_resume_$number" // Tugma bosilganda muayyan rezyumeni o'chirish uchun
+                ]
+            ];
+        }
+
+        // Tugmalarni yuborish
+        $this->sendMessageWithButtons($chat_id, $message, $buttons);
+    }
+
+    public function sendMessageWithButtons($chat_id, $message, $buttons)
+    {
+        Http::post($this->telegramApiUrl . 'sendMessage', [
+            'chat_id' => $chat_id,
+            'text' => $message,
+            'reply_markup' => json_encode([
+                'inline_keyboard' => $buttons, // Inline tugmalar
+                'resize_keyboard' => true,
+                'one_time_keyboard' => true
+            ])
+        ]);
+    }
+
+    public function editResume($chat_id, $resumeIndex)
+    {
+        // Rezyume ma'lumotlarini olish
+        $resume = $this->getResumeByIndex($chat_id, $resumeIndex);
+
+        // Foydalanuvchiga rezyume ma'lumotlarini tahrir qilish uchun yuboring
+        $this->sendMessage($chat_id, "Iltimos, rezyume ma'lumotlarini tahrir qiling:\n{$resume->resume_data}");
+
+        // Foydalanuvchidan yangi rezyume ma'lumotlarini qabul qilish usuli (masalan, matnli xabar)
+    }
+
+    public function removeResume($chat_id, $resumeIndex)
+    {
+        // Rezyumeni o'chirish
+        $this->deleteResumeByIndex($chat_id, $resumeIndex);
+
+        // O'chirish jarayoni tugagach, foydalanuvchiga xabar bering
+        $this->sendMessage($chat_id, "Rezyume muvaffaqiyatli o'chirildi.");
+    }
+
     public function sendMessage($chat_id, $message)
     {
         Http::post($this->telegramApiUrl . 'sendMessage', [
             'chat_id' => $chat_id,
             'text' => $message,
+            'reply_markup' => json_encode(['remove_keyboard' => true]) // Tugmalarni olib tashlang
         ]);
     }
+
+    public function handleCallbackQuery($callbackQuery)
+    {
+        $callbackData = $callbackQuery['data'];
+        $chat_id = $callbackQuery['from']['id'];
+
+        if (preg_match('/edit_resume_(\d+)/', $callbackData, $matches)) {
+            $resumeIndex = (int)$matches[1] - 1; // 1 dan boshlangani uchun -1
+            $this->editResume($chat_id, $resumeIndex);
+        } elseif (preg_match('/remove_resume_(\d+)/', $callbackData, $matches)) {
+            $resumeIndex = (int)$matches[1] - 1; // 1 dan boshlangani uchun -1
+            $this->removeResume($chat_id, $resumeIndex);
+        }
+    }
+
 }
